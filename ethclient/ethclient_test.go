@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"math/big"
 	"reflect"
+	"strconv"
 	"testing"
 	"time"
 
@@ -92,7 +93,7 @@ var testTx2 = types.MustSignNewTx(testKey, types.LatestSigner(genesis.Config), &
 	To:       &common.Address{2},
 })
 
-func newTestBackend(config *node.Config) (*node.Node, []*types.Block, error) {
+func newTestBackend(config *node.Config, t *testing.T) (*node.Node, []*types.Block, *eth.Ethereum, error) {
 	// Generate test chain.
 	blocks := generateTestChain()
 
@@ -102,21 +103,22 @@ func newTestBackend(config *node.Config) (*node.Node, []*types.Block, error) {
 	}
 	n, err := node.New(config)
 	if err != nil {
-		return nil, nil, fmt.Errorf("can't create new node: %v", err)
+		return nil, nil, nil, fmt.Errorf("can't create new node: %v", err)
 	}
 	// Create Ethereum Service
 	ecfg := &ethconfig.Config{Genesis: genesis, RPCGasCap: 1000000}
 	ethservice, err := eth.New(n, ecfg)
 	if err != nil {
-		return nil, nil, fmt.Errorf("can't create new ethereum service: %v", err)
+		return nil, nil, nil, fmt.Errorf("can't create new ethereum service: %v", err)
 	}
 	// Import the test chain.
 	if err := n.Start(); err != nil {
-		return nil, nil, fmt.Errorf("can't start test node: %v", err)
+		return nil, nil, nil, fmt.Errorf("can't start test node: %v", err)
 	}
 	if _, err := ethservice.BlockChain().InsertChain(blocks[1:]); err != nil {
-		return nil, nil, fmt.Errorf("can't import test blocks: %v", err)
+		return nil, nil, nil, fmt.Errorf("can't import test blocks: %v", err)
 	}
+
 	// Ensure the tx indexing is fully generated
 	for ; ; time.Sleep(time.Millisecond * 100) {
 		progress, err := ethservice.BlockChain().TxIndexProgress()
@@ -124,7 +126,7 @@ func newTestBackend(config *node.Config) (*node.Node, []*types.Block, error) {
 			break
 		}
 	}
-	return n, blocks, nil
+	return n, blocks, ethservice, nil
 }
 
 func generateTestChain() []*types.Block {
@@ -142,7 +144,7 @@ func generateTestChain() []*types.Block {
 }
 
 func TestEthClient(t *testing.T) {
-	backend, chain, err := newTestBackend(nil)
+	backend, chain, eth, err := newTestBackend(nil, t)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,7 +180,7 @@ func TestEthClient(t *testing.T) {
 			func(t *testing.T) { testCallContractAtHash(t, client) },
 		},
 		"AtFunctions": {
-			func(t *testing.T) { testAtFunctions(t, client) },
+			func(t *testing.T) { testAtFunctions(t, client, eth) },
 		},
 		"TransactionSender": {
 			func(t *testing.T) { testTransactionSender(t, client) },
@@ -497,7 +499,24 @@ func testCallContract(t *testing.T, client *rpc.Client) {
 	}
 }
 
-func testAtFunctions(t *testing.T, client *rpc.Client) {
+func Test1000loop(t *testing.T) {
+	t.Parallel()
+	for i := 0; i < 10000; i++ {
+		t.Run(strconv.Itoa(i), func(t *testing.T) {
+			t.Parallel()
+			backend, _, ethservice, err := newTestBackend(nil, t)
+			if err != nil {
+				t.Fatal(err)
+			}
+			client := backend.Attach()
+			defer backend.Close()
+			defer client.Close()
+			testAtFunctions(t, client, ethservice)
+		})
+	}
+}
+
+func testAtFunctions(t *testing.T, client *rpc.Client, ethservice *eth.Ethereum) {
 	ec := ethclient.NewClient(client)
 
 	block, err := ec.HeaderByNumber(context.Background(), big.NewInt(1))
@@ -505,11 +524,19 @@ func testAtFunctions(t *testing.T, client *rpc.Client) {
 		t.Fatalf("BlockByNumber error: %v", err)
 	}
 
+	for ; ; time.Sleep(time.Millisecond * 100) {
+		nonce, err := ec.PendingNonceAt(context.Background(), testAddr)
+		if err == nil && nonce == 2 {
+			break
+		}
+	}
+
 	// send a transaction for some interesting pending status
 	// and wait for the transaction to be included in the pending block
 	sendTransaction(ec)
 
 	// wait for the transaction to be included in the pending block
+	i := 0
 	for {
 		// Check pending transaction count
 		pending, err := ec.PendingTransactionCount(context.Background())
@@ -519,7 +546,12 @@ func testAtFunctions(t *testing.T, client *rpc.Client) {
 		if pending == 1 {
 			break
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(1000 * time.Millisecond)
+		penNonce, _ := ec.PendingNonceAt(context.Background(), testAddr)
+		if i > 5 && penNonce == 0 {
+			t.Logf("%s loop detected %d nonce: %d", t.Name(), i, penNonce)
+		}
+		i++
 	}
 
 	// Query balance

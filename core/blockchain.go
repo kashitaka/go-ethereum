@@ -1726,7 +1726,7 @@ func (bc *BlockChain) InsertChain(chain types.Blocks) (int, error) {
 func (bc *BlockChain) insertChain(chain types.Blocks, setHead bool, makeWitness bool) (*stateless.Witness, int, error) {
 	// If the chain is terminating, don't even bother starting up.
 	if bc.insertStopped() {
-		return nil, 0, nil
+		return nil, 0, errors.New("insert stopped")
 	}
 
 	if atomic.AddInt32(&bc.blockProcCounter, 1) == 1 {

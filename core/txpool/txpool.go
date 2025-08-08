@@ -21,13 +21,13 @@ import (
 	"fmt"
 	"math/big"
 	"sync"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/event"
-	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
 )
 
@@ -83,6 +83,7 @@ func New(gasTip uint64, chain BlockChain, subpools []SubPool) (*TxPool, error) {
 	// Retrieve the current head so that all subpools and this main coordinator
 	// pool will have the same starting state, even if the chain moves forward
 	// during initialization.
+	fmt.Println(subpools[0].GetJournal(), "TxPool.New: creating txPool")
 	head := chain.CurrentBlock()
 
 	// Initialize the state with head block, or fallback to empty one in
@@ -113,6 +114,7 @@ func New(gasTip uint64, chain BlockChain, subpools []SubPool) (*TxPool, error) {
 			return nil, err
 		}
 	}
+	fmt.Println(subpools[0].GetJournal(), "TxPool.New: trying to run pool.loop")
 	go pool.loop(head)
 	return pool, nil
 }
@@ -147,6 +149,8 @@ func (p *TxPool) Close() error {
 // eviction events.
 func (p *TxPool) loop(head *types.Header) {
 	// Close the termination marker when the pool stops
+	time.Sleep(1 * time.Second)
+	fmt.Println(p.subpools[0].GetJournal(), "TxPool.loop: started")
 	defer close(p.term)
 
 	// Subscribe to chain head events to trigger subpool resets
@@ -181,6 +185,8 @@ func (p *TxPool) loop(head *types.Header) {
 		// Something interesting might have happened, run a reset if there is
 		// one needed but none is running. The resetter will run on its own
 		// goroutine to allow chain head events to be consumed contiguously.
+		fmt.Println(p.subpools[0].GetJournal(), "TxPool.loop: checking reset condition", "oldHead", oldHead.Number, "newHead", newHead.Number)
+
 		if newHead != oldHead || resetForced {
 			// Try to inject a busy marker and start a reset if successful
 			select {
@@ -188,13 +194,14 @@ func (p *TxPool) loop(head *types.Header) {
 				// Updates the statedb with the new chain head. The head state may be
 				// unavailable if the initial state sync has not yet completed.
 				if statedb, err := p.chain.StateAt(newHead.Root); err != nil {
-					log.Error("Failed to reset txpool state", "err", err)
+					fmt.Println(p.subpools[0].GetJournal(), "Failed to reset txpool state", "err", err)
 				} else {
 					p.stateLock.Lock()
 					p.state = statedb
 					p.stateLock.Unlock()
 				}
 
+				fmt.Printf("%s TxPool.loop: reset start\n", p.subpools[0].GetJournal())
 				// Busy marker injected, start a new subpool reset
 				go func(oldHead, newHead *types.Header) {
 					for _, subpool := range p.subpools {
@@ -223,10 +230,12 @@ func (p *TxPool) loop(head *types.Header) {
 		select {
 		case event := <-newHeadCh:
 			// Chain moved forward, store the head for later consumption
+			fmt.Printf("%s TxPool.loop: received newHead event, block: %v\n", p.subpools[0].GetJournal(), event.Header.Number)
 			newHead = event.Header
 
 		case head := <-resetDone:
 			// Previous reset finished, update the old head and allow a new reset
+			fmt.Printf("%s TxPool.loop: reset done\n", p.subpools[0].GetJournal())
 			oldHead = head
 			<-resetBusy
 
@@ -470,6 +479,7 @@ func (p *TxPool) Status(hash common.Hash) TxStatus {
 // In production code, the pool is meant to reset on a separate thread.
 func (p *TxPool) Sync() error {
 	sync := make(chan error)
+	fmt.Println(p.subpools[0].GetJournal(), "TxPool.Sync: wait for sync")
 	select {
 	case p.sync <- sync:
 		return <-sync

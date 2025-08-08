@@ -21,8 +21,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/ethereum/go-ethereum/core/txpool/legacypool"
 	"math/big"
 	"reflect"
+	"strconv"
 	"testing"
 	"time"
 
@@ -92,7 +94,17 @@ var testTx2 = types.MustSignNewTx(testKey, types.LatestSigner(genesis.Config), &
 	To:       &common.Address{2},
 })
 
-func newTestBackend(config *node.Config) (*node.Node, []*types.Block, error) {
+func Test1000loop(t *testing.T) {
+	for i := 0; i < 100; i++ {
+		t.Run(strconv.Itoa(i), func(t *testing.T) {
+			t.Parallel()
+			backend, _, _ := newTestBackend(nil, t)
+			defer backend.Close()
+		})
+	}
+}
+
+func newTestBackend(config *node.Config, t *testing.T) (*node.Node, []*types.Block, error) {
 	// Generate test chain.
 	blocks := generateTestChain()
 
@@ -105,8 +117,9 @@ func newTestBackend(config *node.Config) (*node.Node, []*types.Block, error) {
 		return nil, nil, fmt.Errorf("can't create new node: %v", err)
 	}
 	// Create Ethereum Service
-	ecfg := &ethconfig.Config{Genesis: genesis, RPCGasCap: 1000000}
+	ecfg := &ethconfig.Config{Genesis: genesis, RPCGasCap: 1000000, TxPool: legacypool.Config{Journal: t.Name()}}
 	ethservice, err := eth.New(n, ecfg)
+	fmt.Println(t.Name(), "init service")
 	if err != nil {
 		return nil, nil, fmt.Errorf("can't create new ethereum service: %v", err)
 	}
@@ -114,27 +127,60 @@ func newTestBackend(config *node.Config) (*node.Node, []*types.Block, error) {
 	if err := n.Start(); err != nil {
 		return nil, nil, fmt.Errorf("can't start test node: %v", err)
 	}
+	client := n.Attach()
+	defer client.Close()
+	ec := ethclient.NewClient(client)
+	//pool := ethservice.TxPool()
+	//err = pool.Sync()
+	if err != nil {
+		return nil, nil, fmt.Errorf("can't sync pool: %v", err)
+	}
 	if _, err := ethservice.BlockChain().InsertChain(blocks[1:]); err != nil {
 		return nil, nil, fmt.Errorf("can't import test blocks: %v", err)
 	}
-	// Ensure the tx indexing is fully generated
-	for ; ; time.Sleep(time.Millisecond * 100) {
-		progress, err := ethservice.BlockChain().TxIndexProgress()
-		if err == nil && progress.Done() {
+	fmt.Println(t.Name(), "chain Inserted")
+	// nonce: 70
+	//tx, err := sendTransaction(ec)
+	//if err != nil {
+	//	return nil, nil, fmt.Errorf("can't send transaction: %v", err)
+	//}
+	i := 0
+	for {
+		penNonce, err := ec.PendingNonceAt(context.Background(), testAddr)
+		if err != nil {
+			return nil, nil, fmt.Errorf("can't get pen nonce: %v", err)
+		}
+		if penNonce == 70 {
 			break
+		}
+		time.Sleep(1 * time.Second)
+		i++
+		if i > 10 {
+			fmt.Printf("%s, too many attempts. penNonce:%d\n", t.Name(), penNonce)
 		}
 	}
 	return n, blocks, nil
 }
 
 func generateTestChain() []*types.Block {
+	txs := make([]*types.Transaction, 0)
+	for i := 0; i < 70; i++ {
+		txs = append(txs, types.MustSignNewTx(testKey, types.LatestSigner(genesis.Config), &types.LegacyTx{
+			Nonce:    uint64(i),
+			Value:    big.NewInt(8),
+			GasPrice: big.NewInt(params.InitialBaseFee),
+			Gas:      params.TxGas,
+			To:       &common.Address{2},
+		}))
+	}
+
 	generate := func(i int, g *core.BlockGen) {
 		g.OffsetTime(5)
 		g.SetExtra([]byte("test"))
 		if i == 1 {
-			// Test transactions are included in block #2.
-			g.AddTx(testTx1)
-			g.AddTx(testTx2)
+			for _, tx := range txs {
+				g.AddTx(tx)
+			}
 		}
 	}
 	_, blocks, _ := core.GenerateChainWithGenesis(genesis, beacon.New(ethash.NewFaker()), 2, generate)
@@ -142,7 +188,7 @@ func generateTestChain() []*types.Block {
 }
 
 func TestEthClient(t *testing.T) {
-	backend, chain, err := newTestBackend(nil)
+	backend, chain, err := newTestBackend(nil, t)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -507,9 +553,15 @@ func testAtFunctions(t *testing.T, client *rpc.Client) {
 
 	// send a transaction for some interesting pending status
 	// and wait for the transaction to be included in the pending block
-	sendTransaction(ec)
+
+	tx, ep := sendTransaction(ec)
+	if ep != nil {
+		t.Logf("unexpected error: %v", err)
+		t.Log(tx)
+	}
 
 	// wait for the transaction to be included in the pending block
+	i := 0
 	for {
 		// Check pending transaction count
 		pending, err := ec.PendingTransactionCount(context.Background())
@@ -519,7 +571,15 @@ func testAtFunctions(t *testing.T, client *rpc.Client) {
 		if pending == 1 {
 			break
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(1 * time.Second)
+		i++
+		if i > 5 {
+			penNonce, _ := ec.PendingNonceAt(context.Background(), testAddr)
+			t.Logf("%s, too many attempts. penNonece: %d, tx err: %v", t.Name(), penNonce, ep)
+			if ep != nil {
+				t.Log(ep.Error())
+			}
+		}
 	}
 
 	// Query balance
@@ -687,14 +747,14 @@ func newCanceledContext() context.Context {
 	return ctx
 }
 
-func sendTransaction(ec *ethclient.Client) error {
+func sendTransaction(ec *ethclient.Client) (*types.Transaction, error) {
 	chainID, err := ec.ChainID(context.Background())
 	if err != nil {
-		return err
+		return nil, err
 	}
 	nonce, err := ec.NonceAt(context.Background(), testAddr, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	signer := types.LatestSignerForChainID(chainID)
@@ -706,9 +766,9 @@ func sendTransaction(ec *ethclient.Client) error {
 		GasPrice: big.NewInt(params.InitialBaseFee),
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return ec.SendTransaction(context.Background(), tx)
+	return tx, ec.SendTransaction(context.Background(), tx)
 }
 
 // Here we show how to get the error message of reverted contract call.

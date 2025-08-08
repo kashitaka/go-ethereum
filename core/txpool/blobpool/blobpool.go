@@ -329,6 +329,10 @@ type BlobPool struct {
 	lock sync.RWMutex // Mutex protecting the pool during reorg handling
 }
 
+func (p *BlobPool) GetJournal() string {
+	return "hoge"
+}
+
 // New creates a new blob transaction pool to gather, sort and filter inbound
 // blob transactions from the network.
 func New(config Config, chain BlockChain, hasPendingAuth func(common.Address) bool) *BlobPool {

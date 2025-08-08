@@ -19,6 +19,7 @@ package legacypool
 
 import (
 	"errors"
+	"fmt"
 	"maps"
 	"math"
 	"math/big"
@@ -398,6 +399,7 @@ func (pool *LegacyPool) Close() error {
 // kept in sync with the main transaction pool's internal state.
 func (pool *LegacyPool) Reset(oldHead, newHead *types.Header) {
 	wait := pool.requestReset(oldHead, newHead)
+	fmt.Printf("%s Reset: waiting for reorgDoneCh to close\n", pool.config.Journal)
 	<-wait
 }
 
@@ -1148,12 +1150,17 @@ func (pool *LegacyPool) removeTx(hash common.Hash, outofbound bool, unreserve bo
 // requestReset requests a pool reset to the new head block.
 // The returned channel is closed when the reset has occurred.
 func (pool *LegacyPool) requestReset(oldHead *types.Header, newHead *types.Header) chan struct{} {
+	fmt.Printf("%s: requestReset: trying to send to reqResetCh\n", pool.config.Journal)
 	select {
 	case pool.reqResetCh <- &txpoolResetRequest{oldHead, newHead}:
 		return <-pool.reorgDoneCh
 	case <-pool.reorgShutdownCh:
 		return pool.reorgShutdownCh
 	}
+}
+
+func (pool *LegacyPool) GetJournal() string {
+	return pool.config.Journal
 }
 
 // requestPromoteExecutables requests transaction promotion checks for the given addresses.
@@ -1180,7 +1187,8 @@ func (pool *LegacyPool) queueTxEvent(tx *types.Transaction) {
 // requestPromoteExecutables instead.
 func (pool *LegacyPool) scheduleReorgLoop() {
 	defer pool.wg.Done()
-
+	i := 0
+	t := time.Now()
 	var (
 		curDone       chan struct{} // non-nil while runReorg is active
 		nextDone      = make(chan struct{})
@@ -1190,9 +1198,18 @@ func (pool *LegacyPool) scheduleReorgLoop() {
 		queuedEvents  = make(map[common.Address]*SortedMap)
 	)
 	for {
+		t = time.Now()
+		i++
+		fmt.Printf("%s: %s scheduleReorgLoop. %d's attempt\n", pool.config.Journal, t.Format("15:04:05"), i)
 		// Launch next background reorg if needed
 		if curDone == nil && launchNextRun {
 			// Run the background reorg and announcements
+			fmt.Printf("%s: %s reorg trigger: reset=%v, dirty=%v, events=%d\n",
+				pool.config.Journal, time.Now().Format("15:04:05"),
+				reset != nil,
+				dirtyAccounts != nil,
+				len(queuedEvents),
+			)
 			go pool.runReorg(nextDone, reset, dirtyAccounts, queuedEvents)
 
 			// Prepare everything for the next round of reorg
@@ -1203,8 +1220,13 @@ func (pool *LegacyPool) scheduleReorgLoop() {
 			queuedEvents = make(map[common.Address]*SortedMap)
 		}
 
+		if curDone != nil && launchNextRun {
+			fmt.Printf("%s: %s reorg skipped (curDone!=nil, launchNextRun==true)\n", pool.config.Journal, t.Format("15:04:05"))
+		}
+
 		select {
 		case req := <-pool.reqResetCh:
+			fmt.Printf("%s: %s received reqResetCh\n", pool.config.Journal, t.Format("15:04:05"))
 			// Reset request: update head if request is already pending.
 			if reset == nil {
 				reset = req
@@ -1215,6 +1237,7 @@ func (pool *LegacyPool) scheduleReorgLoop() {
 			pool.reorgDoneCh <- nextDone
 
 		case req := <-pool.reqPromoteCh:
+			fmt.Printf("%s: %s received reqPromoteCh\n", pool.config.Journal, t.Format("15:04:05"))
 			// Promote request: update address set if request is already pending.
 			if dirtyAccounts == nil {
 				dirtyAccounts = req
@@ -1228,12 +1251,14 @@ func (pool *LegacyPool) scheduleReorgLoop() {
 			// Queue up the event, but don't schedule a reorg. It's up to the caller to
 			// request one later if they want the events sent.
 			addr, _ := types.Sender(pool.signer, tx)
+			fmt.Printf("%s: %s received queueTxEventCh for addr %x\n", pool.config.Journal, t.Format("15:04:05"), addr)
 			if _, ok := queuedEvents[addr]; !ok {
 				queuedEvents[addr] = NewSortedMap()
 			}
 			queuedEvents[addr].Put(tx)
 
 		case <-curDone:
+			fmt.Printf("%s: %s reorg finished\n", pool.config.Journal, t.Format("15:04:05"))
 			curDone = nil
 
 		case <-pool.reorgShutdownCh:

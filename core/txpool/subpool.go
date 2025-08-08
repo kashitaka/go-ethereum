@@ -115,6 +115,8 @@ type SubPool interface {
 	// of the transaction pool is valid with regard to the chain state.
 	Reset(oldHead, newHead *types.Header)
 
+	GetJournal() string
+
 	// SetGasTip updates the minimum price required by the subpool for a new
 	// transaction, and drops all transactions below this threshold.
 	SetGasTip(tip *big.Int)
